@@ -327,7 +327,7 @@ public:
     bool runOnFunction(Function &F, bool *CFGModified = nullptr);
 
 private:
-    CallInst *pgcstack;
+    Value *pgcstack;
 
     void MaybeNoteDef(State &S, BBState &BBS, Value *Def, const ArrayRef<int> &SafepointsSoFar,
                       SmallVector<int, 1> &&RefinedPtr = SmallVector<int, 1>());
@@ -385,7 +385,7 @@ private:
     Function *smallAllocFunc;
     Function *bigAllocFunc;
     Function *allocTypedFunc;
-    Instruction *pgcstack;
+    Value *pgcstack;
     Type *T_size;
 
     // Lowers a `julia.new_gc_frame` intrinsic.

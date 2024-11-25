@@ -576,7 +576,7 @@ void *jl_create_native_impl(jl_array_t *methods, LLVMOrcThreadSafeModuleRef llvm
     orc::ThreadSafeModule backing;
     if (!llvmmod) {
         ctx = jl_ExecutionEngine->makeContext();
-        backing = jl_create_ts_module("text", ctx);
+        backing = jl_create_ts_module("text", ctx, jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple());
     }
     orc::ThreadSafeModule &clone = llvmmod ? *unwrap(llvmmod) : backing;
     auto ctxt = clone.getContext();
@@ -2253,6 +2253,8 @@ extern "C" JL_DLLEXPORT_CODEGEN jl_code_info_t *jl_gdbdumpcode(jl_method_instanc
     return src;
 }
 
+void emit_always_inline(orc::ThreadSafeModule &result_m, jl_codegen_params_t &params, SmallVector<std::pair<jl_code_instance_t*, Function*>> &always_inline) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER;
+
 // --- native code info, and dump function to IR and ASM ---
 // Get pointer to llvm::Function instance, compiling if necessary
 // for use in reflection from Julia.
@@ -2265,7 +2267,10 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t* dump, jl_method_instance_t *mi, jl_
     dump->TSM = nullptr;
     if (src && jl_is_code_info(src)) {
         auto ctx = jl_ExecutionEngine->makeContext();
-        orc::ThreadSafeModule m = jl_create_ts_module(name_from_method_instance(mi), ctx);
+        // To get correct names in the IR params.debug_info_level needs to be at least 2,
+        // which would also be nice, but it seems to cause OOMs on the windows32 builder
+        orc::ThreadSafeModule m = jl_create_ts_module(name_from_method_instance(mi), ctx,
+            jl_ExecutionEngine->getDataLayout(), jl_ExecutionEngine->getTargetTriple());
         uint64_t compiler_start_time = 0;
         uint8_t measure_compile_time_enabled = jl_atomic_load_relaxed(&jl_measure_compile_time_enabled);
         if (measure_compile_time_enabled)
@@ -2280,11 +2285,18 @@ void jl_get_llvmf_defn_impl(jl_llvmf_dump_t* dump, jl_method_instance_t *mi, jl_
         // differ very significantly from the actual non-imaging mode code.
         // // Force imaging mode for names of pointers
         // output.imaging = true;
-        // This would also be nice, but it seems to cause OOMs on the windows32 builder
-        // To get correct names in the IR this needs to be at least 2
         output.temporary_roots = jl_alloc_array_1d(jl_array_any_type, 0);
         JL_GC_PUSH1(&output.temporary_roots);
         auto decls = jl_emit_code(m, mi, src, output);
+        SmallVector<std::pair<jl_code_instance_t*, Function*>> always_inline;
+        for (auto &it : output.workqueue) {
+            jl_code_instance_t *codeinst = it.first;
+            auto &proto = it.second;
+            if (proto.always_inline) {
+                always_inline.push_back(std::pair(codeinst, proto.decl));
+            }
+        }
+        emit_always_inline(m, output, always_inline);
         output.temporary_roots = nullptr;
         JL_GC_POP(); // GC the global_targets array contents now since reflection doesn't need it
 

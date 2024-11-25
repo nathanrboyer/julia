@@ -211,6 +211,7 @@ struct jl_codegen_call_target_t {
     llvm::Function *decl;
     llvm::Function *oc;
     bool specsig;
+    bool always_inline = false;
 };
 
 typedef SmallVector<std::pair<jl_code_instance_t*, jl_codegen_call_target_t>, 0> jl_workqueue_t;
@@ -259,6 +260,7 @@ struct jl_codegen_params_t {
     bool cache = false;
     bool external_linkage = false;
     bool imaging_mode;
+    bool safepoint_on_entry = true;
     bool use_swiftcc = true;
     jl_codegen_params_t(orc::ThreadSafeContext ctx, DataLayout DL, Triple triple)
       : tsctx(std::move(ctx)),
@@ -646,8 +648,8 @@ private:
     OptSelLayerT OptSelLayer;
 };
 extern JuliaOJIT *jl_ExecutionEngine;
-std::unique_ptr<Module> jl_create_llvm_module(StringRef name, LLVMContext &ctx, const DataLayout &DL = jl_ExecutionEngine->getDataLayout(), const Triple &triple = jl_ExecutionEngine->getTargetTriple()) JL_NOTSAFEPOINT;
-inline orc::ThreadSafeModule jl_create_ts_module(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL = jl_ExecutionEngine->getDataLayout(), const Triple &triple = jl_ExecutionEngine->getTargetTriple()) JL_NOTSAFEPOINT {
+std::unique_ptr<Module> jl_create_llvm_module(StringRef name, LLVMContext &ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT;
+inline orc::ThreadSafeModule jl_create_ts_module(StringRef name, orc::ThreadSafeContext ctx, const DataLayout &DL, const Triple &triple) JL_NOTSAFEPOINT {
     auto lock = ctx.getLock();
     return orc::ThreadSafeModule(jl_create_llvm_module(name, *ctx.getContext(), DL, triple), ctx);
 }

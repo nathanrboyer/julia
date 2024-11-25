@@ -215,6 +215,7 @@ static void jl_optimize_roots(jl_codegen_params_t &params, jl_method_instance_t 
     }
     if (jl_is_method(m))
         JL_UNLOCK(&m->writelock);
+    jl_array_del_end(params.temporary_roots, jl_array_dim0(params.temporary_roots));
 }
 
 void jl_jit_globals(std::map<void *, GlobalVariable*> &globals) JL_NOTSAFEPOINT
@@ -265,6 +266,75 @@ static DenseMap<jl_code_instance_t*, SmallVector<jl_code_instance_t*,0>> incompl
 //     However, this guarantee relies on Julia releasing all TSC locks before causing any materialization units to be dispatched
 //     as materialization may need to acquire TSC locks.
 
+/// Stolen from IRMover.cpp, since it is private there
+static void linkFunctionBody(Function &Dst, Function &Src)
+{
+    assert(Dst.isDeclaration() && !Src.isDeclaration());
+
+    // Link in the operands without remapping.
+    if (Src.hasPrefixData())
+        Dst.setPrefixData(Src.getPrefixData());
+    if (Src.hasPrologueData())
+        Dst.setPrologueData(Src.getPrologueData());
+    if (Src.hasPersonalityFn())
+        Dst.setPersonalityFn(Src.getPersonalityFn());
+    if (Src.hasPersonalityFn())
+        Dst.setPersonalityFn(Src.getPersonalityFn());
+    assert(Src.IsNewDbgInfoFormat == Dst.IsNewDbgInfoFormat);
+
+    // Copy over the metadata attachments without remapping.
+    Dst.copyMetadata(&Src, 0);
+
+    // Steal arguments and splice the body of Src into Dst.
+    Dst.stealArgumentListFrom(Src);
+    Dst.splice(Dst.end(), &Src);
+}
+
+
+void emit_always_inline(orc::ThreadSafeModule &result_m, jl_codegen_params_t &params, SmallVector<std::pair<jl_code_instance_t*, Function*>> &always_inline) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
+{
+    params.safepoint_on_entry = false;
+    if (always_inline.empty())
+        return;
+    jl_task_t *ct = jl_current_task;
+    int8_t gc_state = jl_gc_unsafe_enter(ct->ptls); // codegen may contain safepoints (such as jl_subtype calls)
+    jl_code_info_t *src = nullptr;
+    params.temporary_roots = jl_alloc_array_1d(jl_array_any_type, 0);
+    JL_GC_PUSH2(&params.temporary_roots, &src);
+    for (auto &callee : always_inline) {
+        jl_code_instance_t *codeinst = callee.first;
+        Function *&proto = callee.second;
+        if (proto->isDeclaration()) {
+            src = (jl_code_info_t*)jl_atomic_load_relaxed(&codeinst->inferred);
+            jl_method_instance_t *mi = codeinst->def;
+            jl_method_t *def = mi->def.method;
+            if (src && (jl_value_t*)src != jl_nothing && jl_is_method(def) && jl_ir_inlining_cost((jl_value_t*)src) < UINT16_MAX)
+                src = jl_uncompress_ir(def, codeinst, (jl_value_t*)src);
+            if (src && jl_is_code_info(src) && jl_ir_inlining_cost((jl_value_t*)src) < UINT16_MAX) {
+                jl_llvm_functions_t decls = jl_emit_code(result_m, codeinst->def, src, params); // contains safepoints
+                if (!result_m)
+                    break;
+                jl_optimize_roots(params, codeinst->def, *result_m.getModuleUnlocked()); // contains safepoints
+                Module &M = *result_m.getModuleUnlocked();
+                if (decls.functionObject != "jl_fptr_args" &&
+                    decls.functionObject != "jl_fptr_sparam" &&
+                    decls.functionObject != "jl_f_opaque_closure_call") {
+                    Function *F = M.getFunction(decls.functionObject);
+                    F->eraseFromParent();
+                }
+                if (!decls.specFunctionObject.empty()) {
+                    Function *specF = M.getFunction(decls.specFunctionObject);
+                    proto->setLinkage(GlobalValue::AvailableExternallyLinkage);
+                    linkFunctionBody(*proto, *specF);
+                    specF->eraseFromParent();
+                }
+            }
+        }
+    }
+    params.temporary_roots = nullptr;
+    JL_GC_POP();
+    jl_gc_unsafe_leave(ct->ptls, gc_state);
+}
 
 static void finish_params(Module *M, jl_codegen_params_t &params) JL_NOTSAFEPOINT
 {
@@ -306,10 +376,10 @@ static void finish_params(Module *M, jl_codegen_params_t &params) JL_NOTSAFEPOIN
 }
 
 
-static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t &params, bool forceall=false) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
+static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t &params, SmallVector<std::pair<jl_code_instance_t*, Function *>> &always_inline, bool forceall=false) JL_NOTSAFEPOINT_LEAVE JL_NOTSAFEPOINT_ENTER
 {
     jl_task_t *ct = jl_current_task;
-    decltype(params.workqueue) edges;
+    jl_workqueue_t edges;
     std::swap(params.workqueue, edges);
     for (auto &it : edges) {
         jl_code_instance_t *codeinst = it.first;
@@ -369,8 +439,11 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                         invokeName = jl_ExecutionEngine->getFunctionAtAddress((uintptr_t)invoke, invoke, codeinst);
                 }
                 pinvoke = emit_tojlinvoke(codeinst, invokeName, mod, params);
-                if (!proto.specsig)
+                if (!proto.specsig) {
                     proto.decl->replaceAllUsesWith(pinvoke);
+                    proto.decl->eraseFromParent();
+                    proto.decl = nullptr;
+                }
                 isedge = false;
             }
             if (proto.specsig && !preal_specsig) {
@@ -392,9 +465,12 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
             }
             if (!preal_decl.empty()) {
                 // merge and/or rename this prototype to the real function
-                if (Value *specfun = mod->getNamedValue(preal_decl)) {
-                    if (proto.decl != specfun)
+                if (GlobalValue *specfun = mod->getNamedValue(preal_decl)) {
+                    if (proto.decl != specfun) {
                         proto.decl->replaceAllUsesWith(specfun);
+                        proto.decl->eraseFromParent();
+                        proto.decl = cast<Function>(specfun);
+                    }
                 }
                 else {
                     proto.decl->setName(preal_decl);
@@ -436,6 +512,9 @@ static int jl_analyze_workqueue(jl_code_instance_t *callee, jl_codegen_params_t 
                 else {
                     proto.oc->setName(ocinvokeDecl);
                 }
+            }
+            if (proto.always_inline && proto.decl != nullptr && proto.decl->isDeclaration()) {
+                always_inline.push_back(std::pair(codeinst, proto.decl));
             }
         }
         else {
@@ -492,7 +571,9 @@ static void prepare_compile(jl_code_instance_t *codeinst) JL_NOTSAFEPOINT_LEAVE 
             std::get<1>(it->second) = 0;
             auto &params = std::get<0>(it->second);
             params.tsctx_lock = params.tsctx.getLock();
-            waiting = jl_analyze_workqueue(codeinst, params, true); // may safepoint
+            SmallVector<std::pair<jl_code_instance_t*, Function *>> always_inline;
+            waiting = jl_analyze_workqueue(codeinst, params, always_inline, true); // may safepoint
+            always_inline.clear();
             assert(!waiting); (void)waiting;
             Module *M = emittedmodules[codeinst].getModuleUnlocked();
             finish_params(M, params);
@@ -524,10 +605,12 @@ static void complete_emit(jl_code_instance_t *edge) JL_NOTSAFEPOINT_LEAVE JL_NOT
             auto &params = std::get<0>(it->second);
             params.tsctx_lock = params.tsctx.getLock();
             assert(callee == it->first);
-            int waiting = jl_analyze_workqueue(callee, params); // may safepoint
+            SmallVector<std::pair<jl_code_instance_t*, Function *>> always_inline;
+            int waiting = jl_analyze_workqueue(callee, params, always_inline); // may safepoint
             assert(!waiting); (void)waiting;
-            Module *M = emittedmodules[callee].getModuleUnlocked();
-            finish_params(M, params);
+            orc::ThreadSafeModule &M = emittedmodules[callee];
+            emit_always_inline(M, params, always_inline);
+            finish_params(M.getModuleUnlocked(), params);
             incompletemodules.erase(it);
         }
     }
@@ -714,7 +797,9 @@ static void jl_emit_codeinst_to_jit(
     invokenames[codeinst] = std::move(decls);
     complete_emit(codeinst);
     params.tsctx_lock = params.tsctx.getLock(); // re-acquire lock
-    int waiting = jl_analyze_workqueue(codeinst, params);
+    SmallVector<std::pair<jl_code_instance_t*, Function *>> always_inline;
+    int waiting = jl_analyze_workqueue(codeinst, params, always_inline);
+    emit_always_inline(result_m, params, always_inline);
     if (waiting) {
         auto release = std::move(params.tsctx_lock); // unlock again before moving from it
         incompletemodules.insert(std::pair(codeinst, std::make_tuple(std::move(params), waiting)));
