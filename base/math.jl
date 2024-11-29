@@ -113,7 +113,7 @@ function _evalpoly(x, p)
     p0 = iszero(N) ? reduce_empty_iter(+, p) : @inbounds p[N]
     s = oftype(one(x) * p0, p0)
     for i in N-1:-1:1
-        @inbounds s = muladd(x, s, p[i])
+        s = muladd(x, s, @inbounds p[i])
     end
     return s
 end
